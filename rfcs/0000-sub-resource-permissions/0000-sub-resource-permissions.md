@@ -11,27 +11,24 @@ parent (e.g., runs and assessments under experiments, versions under registered
 models) are **not** independently permissionable — every operation on them
 resolves to the parent's permission level.
 
-This RFC makes a curated set of child resource types **independently grantable**,
-using a single, uniform resolution rule: a child's effective permission is the
-**most-permissive** of its inherited parent permission and any direct grant on
-the child.
+This RFC makes a curated set of child resource types **independently grantable**.
+When the caller has any grant on the child type, the child is evaluated on its own
+tier and the parent is not consulted; otherwise it falls back to the parent, exactly
+as today. This is fully backward compatible — with no child grant, every child
+inherits its parent's permission with no configuration change — and a positive child
+grant *raises* the child above its inherited level (escalation).
 
-```
-effective(child) = max(inherited_parent_permission, direct_child_grant)
-```
-
-- **No grant on the child** → the child inherits its parent's permission exactly
-  as today. This is fully backward compatible: existing deployments behave
-  identically with no configuration change.
-- **A grant on the child** → the child is *raised* to that level (escalation).
-
-This is the same monotonic, allow-only fold MLflow already uses when combining
-workspace-wide and resource-specific grants.
+It also introduces a `NONE` permission level for *restriction*: a `(child, NONE)`
+grant denies the child even where the parent would grant access, letting an operator
+carve out one sub-resource with a single additive grant while all other inheritance
+stays intact. `NONE` is an absolute deny within its tier, evaluated ahead of the
+`max` fold. However, the workspace-admin bypass takes precedence over `NONE`. See
+[Enforcing permissions](#enforcing-permissions) for the full precedence.
 
 # Basic example
 
-Granting a child type raises it above its parent; not granting it leaves it
-inheriting from the parent.
+Granting a child type raises it above its parent; a `NONE` grant denies it below the
+parent; not granting it leaves it inheriting from the parent.
 
 ```python
 # Baseline (unchanged from today): EDIT on experiment flows to all children.
@@ -48,6 +45,12 @@ client.add_role_permission(evaluator_role.id, "assessment", "*", "EDIT")
 client.add_role_permission(pipeline_role.id, "experiment", "*", "READ")
 client.add_role_permission(pipeline_role.id, "run", "*", "EDIT")
 # → experiment stays READ (cannot rename/delete); runs raised to EDIT.
+
+# Restriction (NONE): edit the experiment, but deny traces (e.g. they carry
+# sensitive prompt content). One additive grant; all other inheritance untouched.
+client.add_role_permission(restricted_role.id, "experiment", "*", "EDIT")
+client.add_role_permission(restricted_role.id, "trace", "*", "NONE")
+# → experiment/run/assessment stay EDIT (inherited); trace denied.
 ```
 
 Effective permissions:
@@ -57,6 +60,7 @@ Effective permissions:
 | data-scientist | EDIT | EDIT (inherited) | EDIT (inherited) | EDIT (inherited) |
 | evaluator | READ | READ (inherited) | READ (inherited) | **EDIT** (raised) |
 | pipeline | READ | **EDIT** (raised) | READ (inherited) | READ (inherited) |
+| restricted | EDIT | EDIT (inherited) | **DENY** (NONE) | EDIT (inherited) |
 
 ## Motivation
 
@@ -83,10 +87,9 @@ tagging the experiment.
 
 The experiment grant is `READ`, not lower: a user must be able to read an
 experiment to discover and target it (`GetExperiment` / `SearchExperiments` require
-experiment `can_read`), and must be a workspace member (workspace `USE`). Run
-`EDIT` then supplies the create/log capability on runs. Experiment *creation* is a
-separate workspace-level gate (USE/MANAGE), not experiment EDIT, and is unchanged
-by this RFC.
+experiment `can_read`). Run `EDIT` then supplies the create/log capability on runs.
+Experiment *creation* is a separate workspace-level gate (USE/MANAGE), not experiment
+EDIT, and is unchanged by this RFC.
 
 **2. Assessment write access (validation boundary)**
 
@@ -108,15 +111,36 @@ requires the parent `registered_model`'s update capability, so enabling version
 creation also permits managing the model entry.
 
 - **Example user:** a data scientist who registers new versions of existing models.
-- **Policy:** `(registered_model, *, READ)` + `(model_version, *, EDIT)`
+- **Policy:** `(registered_model, *, READ)` + `(registered_model_version, *, EDIT)`
 - **Result:** can create/update model versions; cannot rename, delete, or
   re-alias the registered model.
 
-Making `model_version` a first-class grantable type also sets up a future
+Making `registered_model_version` a first-class grantable type could also enable a future
 capability this RFC does **not** include: condition-based access control on
 versions — e.g. protecting versions that carry a given alias (`champion`,
-`production`) or tag. That is deferred to the condition-based access-control RFC;
-this RFC grants on the `model_version` type at wildcard grain only.
+`production`) or tag. Any such conditions would be a separate effort; this RFC
+grants on the `registered_model_version` type at wildcard grain only.
+
+**4. Restriction: deny a child below its inherited parent (`NONE`)**
+
+The cases above are escalations. The inverse — *withholding* a child that
+inheritance would otherwise grant — cannot be expressed by escalation and motivates
+the `NONE` level:
+
+- **Evaluator, stricter:** the assessment evaluator of case 2,
+  additionally denied read on runs and models —
+  `(experiment, *, READ)` + `(assessment, *, EDIT)` + `(run, *, NONE)` +
+  `(logged_model, *, NONE)`. Views traces and writes assessments; runs and logged
+  models are denied even though the experiment is readable.
+- **Runs but not traces:** an analyst who may read run metrics/params but must not
+  see trace payloads (sensitive prompt/response content) —
+  `(experiment, *, READ)` + `(trace, *, NONE)`. Reads the experiment and its runs;
+  traces are denied; other children keep inheriting.
+
+Each is a single additive `NONE` grant layered on an otherwise unchanged inheriting
+role — the parent grant and every other child stay intact. This is why `NONE` is in
+scope: the inheritance model makes broad access the default, and some boundaries can
+only be drawn by denying a specific child below it.
 
 ### Out of scope
 
@@ -128,7 +152,7 @@ this RFC grants on the `model_version` type at wildcard grain only.
 - **Request-level (pre-request) condition push-down for the new child types.**
   Efficient conditional filtering — injecting the caller's authorized predicate
   into the query before it hits the store (see mlflow/mlflow#24964) — is not added
-  for `run`/`trace`/`assessment`/`model_version` here. This RFC stays at wildcard
+  for `run`/`trace`/`assessment`/`registered_model_version` here. This RFC stays at wildcard
   grain precisely so search filtering needs no push-down (a single
   wildcard-can-read check per type); any future per-attribute or per-id conditional
   search for these types depends on that push-down mechanism and is deferred with
@@ -179,19 +203,20 @@ The design has two aspects, each a top-level section below:
    `(resource_type, pattern, level)` grants are accepted or rejected).
 2. **[Enforcing permissions](#enforcing-permissions)** — mapping an incoming request
    to a permission validator and running it to allow or deny (the entry point and
-   validator map, the permission fold (parent resolution and route re-pointing),
-   and search filtering).
+   validator map, and the permission fold — parent resolution, route re-pointing,
+   and the `NONE` deny).
 
 ### Granting permissions
 
 #### Grantable resource types
 **Proposed methodology.** A child type is made independently grantable when we have
-identified customer use cases in which the child needs escalated permissions
-relative to its parent and to the other children under that parent. The max model
-fits this precisely: it is monotonic and allow-only, so a child grant *raises* that
-child above its inherited level. Children with no such use case keep inheriting from
-their parent, which keeps the grant surface small. This is the inclusion criterion
-for this RFC and future additions.
+identified customer use cases in which the child needs a permission that differs from
+its parent and from the other children under that parent. A child grant, when
+present, is authoritative for that child: a positive grant *raises* it above its
+inherited level (escalation), and a `NONE` grant *denies* it below the parent
+(restriction). Children with no such use case keep inheriting from their parent,
+which keeps the grant surface small. This is the inclusion criterion for this RFC and
+future additions.
 
 Two scoping principles bound the candidate set. First, this RFC targets only routes
 that **already have resource-scoped authorization** — routes gated by authentication
@@ -234,10 +259,10 @@ _Verified against MLflow 3.15.1 source._
 |----------------|---------------------------|
 | `workspace` | — (the root scope; parents everything) |
 | `experiment` | `run`, `trace`, `assessment`, `logged_model`, `review_queue` (and `label_schema`, `prompt_optimization_job`, excluded) |
-| `registered_model` | `model_version` |
+| `registered_model` | `registered_model_version` |
 | `prompt` | `prompt_version` |
-| `scorer` | `scorer_version` (excluded) |
-| `mcp_server` | `mcp_server_version` (excluded) |
+| `scorer` | `scorer_version` |
+| `mcp_server` | `mcp_server_version` |
 | `gateway_endpoint` | `gateway_endpoint_binding` (excluded) |
 | `gateway_model_definition` | — |
 | `gateway_secret` | — |
@@ -247,7 +272,7 @@ independently grantable. The two tables together are the whole grantable model o
 this RFC lands; sub-resources marked **Yes** are what it adds. All grants are
 per-workspace.
 
-| Parent | Sub-resource | Grantable? | [Grain](#search-filtering) | Escalation use case | Addable later? |
+| Parent | Sub-resource | Grantable? | Grain | Escalation use case | Addable later? |
 |--------|--------------|------------|-------|---------------------|----------------|
 | `experiment` | `run` | **Yes** | wildcard | log runs without experiment management | in scope |
 | `experiment` | `trace` | **Yes** | wildcard | trace-level escalation alongside runs/assessments | in scope |
@@ -256,16 +281,16 @@ per-workspace.
 | `experiment` | `review_queue` | **Yes** | wildcard | operate a review/labeling queue (add/remove items) without experiment EDIT | in scope |
 | `experiment` | `label_schema` | No | — | none today — authored by whoever manages the experiment | Yes |
 | `experiment` | `prompt_optimization_job` | No | — | dormant entity — exists in the data model but has no active SDK/UI surface (candidate for removal), so no persona needs it | Yes |
-| `registered_model` | `model_version` | **Yes** | wildcard | push versions without registry management (use case 3) | in scope |
-| `prompt` | `prompt_version` | **Yes** | wildcard | push prompt versions without managing the prompt entry (mirrors `model_version`) | in scope |
-| `scorer` | `scorer_version` | No | — | none today — versions are immutable/append-only (no alias, tag, or mutable field to protect) | Yes |
-| `mcp_server` | `mcp_server_version` | No | — | none today — inherits; parallels `model_version` if a use case arises | Yes |
+| `registered_model` | `registered_model_version` | **Yes** | wildcard | push versions without registry management (use case 3) | in scope |
+| `prompt` | `prompt_version` | **Yes** | wildcard | push prompt versions without managing the prompt entry (mirrors `registered_model_version`) | in scope |
+| `scorer` | `scorer_version` | **Yes** | wildcard | push scorer versions without managing the scorer entry (mirrors `registered_model_version`) | in scope |
+| `mcp_server` | `mcp_server_version` | **Yes** | wildcard | push MCP server versions without managing the server entry (mirrors `registered_model_version`) | in scope |
 | `gateway_endpoint` | `gateway_endpoint_binding` | No | — | gated on the `gateway_endpoint` alone today (the endpoint controls create/delete/list of its bindings); the binding is a two-sided link (endpoint + consumer), and requiring both sides' permissions would change existing behavior — out of scope | No |
 
 Notes:
 - **Grain is wildcard-only in this RFC.** Every grantable child is at `*` grain;
   id-level grain (`(trace, <id>, …)`) will be added once request-level search-filter
-  push-down is in place (see [Search filtering](#search-filtering)).
+  push-down is in place (see [Out of scope](#out-of-scope)).
 
 #### Grant validation
 When an operator **adds or updates a permission grant** (`grant_user_permission` /
@@ -278,13 +303,13 @@ types simply flow through them:
 - **The auth model must explicitly declare the resource type:** `_validate_resource_type`
   rejects any type not in `VALID_RESOURCE_TYPES` (which now includes the new children).
 - **The permission level must be valid:** `get_permission` rejects anything that is
-  not `READ`/`USE`/`EDIT`/`MANAGE`.
+  not `READ`/`USE`/`EDIT`/`MANAGE`/`NONE` (`NONE` is the new absolute-deny level).
 
 The **one new rule** is pattern validation, which does not exist today —
 `resource_pattern` is currently passed to the store unchecked:
 
-- **The pattern must be a kind the type declares:** `resource_pattern` must match
-  one of `TYPE[resource_type].patterns` — so a concrete-id child grant
+- **The pattern must be a kind the type declares:** `resource_pattern` must be an
+  allowed grain in `TYPE[resource_type]` — so a concrete-id child grant
   (`(run, <run_id>, …)`) is rejected while `(run, *, …)` and a parent's
   `(experiment, "*" | id, …)` are accepted, enforcing the wildcard-only grain at the
   source rather than in the fold.
@@ -292,42 +317,78 @@ The **one new rule** is pattern validation, which does not exist today —
 Rejections surface as a validation error on the grant API naming the offending
 field, so the operator gets an explicit reason rather than a silently-ineffective
 grant. The valid grants are therefore `(child_type, "*", LEVEL)` for any grantable
-child, or the existing `(parent_type, "*" | id, LEVEL)` for a parent — anything else
-is refused up front.
+child — where `LEVEL` may be `NONE` to deny — or the existing
+`(parent_type, "*" | id, LEVEL)` for a parent; anything else is refused up front.
 
 ### Enforcing permissions
 
-An incoming request is mapped to a validator, which resolves the target's effective
-permission and allows or denies. The subsections below cover the entry point and
-validator map, the permission fold that answers the check (including how a child
-resolves its parent and how its routes re-point onto the child), and search-result
-filtering.
+An incoming request is authorized in two halves, matching the now-merged pluggable
+auth model ([RFC 0008](https://github.com/mlflow/rfcs/blob/main/rfcs/0008-pluggable-auth/0008-pluggable-auth.md)):
+**core** extracts a normalized `AuthorizationRequirement` from the request (no
+decision), and an **`AuthorizationBackend`** decides allow/deny from it. This RFC
+touches both halves minimally: core wires the child's **parent** through on the
+requirement (exactly as it already wires `workspace`), and the default DB backend's
+fold gains child-tier resolution with `NONE` deny. The subsections below cover the
+requirement shape, the entry point/validator map that produces it, and the fold that
+decides it.
 
 The overall flow (dashed = added by this RFC):
 
 ```mermaid
 flowchart TD
-    REQ["Request on a child<br/>(e.g. LogMetric on a run)"] --> V["_before_request → validator<br/>resolves child's workspace via parent<br/>(run → experiment → workspace)"]
-    V --> FOLD["get_role_permission_for_resource:<br/>one pass over the user's role grants,<br/>max_permission over all matching clauses"]
+    REQ["Request on a child<br/>(e.g. LogMetric on a run)"] --> CORE["core: extract AuthorizationRequirement<br/>resolve child's workspace AND parent<br/>(run → experiment → workspace)"]
+    CORE --> REQT["requirement:<br/>(resource_type=run, resource_id, action, workspace,<br/>parent_resource_type=experiment, parent_resource_id)"]
+    REQT --> BE["AuthorizationBackend.authorize<br/>(default DB backend realizes the fold)"]
 
-    FOLD --> WS["clause: workspace-wide MANAGE<br/>(workspace, *, MANAGE)"]
-    FOLD --> CHILD["clause: direct grant on the child type<br/>(run, *) — wildcard-only"]
-    FOLD --> PARENT["clause: grant on the parent type<br/>(experiment, * or id) — inheritance"]
+    BE --> ADMIN{"workspace-admin<br/>(workspace, *, MANAGE)?"}
+    ADMIN -->|yes| ALLOW["allow"]
+    ADMIN -->|no| CHILDT["child tier: any grant on child type?"]
 
-    WS --> MAX(["max of all matching clauses"])
-    CHILD -.-> MAX
-    PARENT -.-> MAX
+    CHILDT -->|"grant present"| OWN["own-tier: NONE → deny;<br/>else max(child grants)"]
+    CHILDT -.->|"no child grant"| PAR["parent fallback:<br/>NONE → deny; else max(parent grants)"]
 
-    MAX --> DECIDE{"effective permission<br/>satisfies route capability?"}
-    DECIDE -->|yes| ALLOW["allow"]
+    OWN --> DECIDE{"satisfies route capability?"}
+    PAR --> DECIDE
+    DECIDE -->|yes| ALLOW
     DECIDE -->|no| DENY["403"]
 
-    class CHILD,PARENT newpart
+    class OWN,PAR,CHILDT newpart
     classDef newpart stroke-dasharray:5 5,stroke-width:2px
 ```
 
-The subsections below walk each box: the entry point + validator map, the fold and
-its clauses, and how the child's parent (and workspace) are resolved.
+The subsections below walk each box: the requirement + how core produces it, the
+entry point/validator map, and the tier-override fold (escalation via `max`,
+restriction via `NONE`).
+
+#### The AuthorizationRequirement (parent wired through)
+
+RFC 0008 hands the backend a normalized requirement and keeps route knowledge in
+core. Today that requirement is a single leaf
+`(resource_type, resource_id, action, workspace)`. To authorize a child under the
+inheritance model, the backend needs the child's **parent** as well — and, exactly
+like `workspace`, the parent is a **request-time containment fact the backend cannot
+derive from the id alone**: a `run_id` no more declares its parent experiment than
+its workspace. So core resolves it (RFC 0008's own `GetRun` example already resolves
+run → experiment → workspace) and wires it through as two optional fields:
+
+```python
+@dataclass(frozen=True)
+class AuthorizationRequirement:
+    resource_type: str                        # child, e.g. "run"
+    resource_id: str | None
+    action: str
+    workspace: str | None                     # core-resolved scope (existing)
+    parent_resource_type: str | None = None   # (NEW) core-resolved parent, e.g. "experiment"
+    parent_resource_id: str | None = None      # (NEW) e.g. experiment_id
+```
+
+This keeps the RFC 0008 contract intact — one requirement, one `authorize()`, one
+`Decision`. Top-level resources leave
+`parent_*` as `None` (mirroring `workspace=None` when workspaces are disabled), so
+existing requirements are unchanged. Because the parent is on the wire, a
+third-party backend *can* honor inheritance too; whether it does is the backend's
+decision (RFC 0008: the backend owns the decision, core owns extraction). The
+default DB backend honors it via the fold below.
 
 #### Entry point and validator interface
 
@@ -345,7 +406,7 @@ _before_request(request)                     # Flask entry hook (auth, admin byp
      └─ validator()                          # e.g. validate_can_update_run — the capability gate
           └─ _get_permission_from_run_id()   # the existing per-child resolver (custom logic)
                └─ get_role_permission_for_resource(user, resource_type, resource_id, workspace,
-                                                    child_type, child_id)   # max over grants
+                                                    parent_type, parent_id)  # tier-override + NONE
           → .can_update / .can_read / …       # validator checks the resulting Permission
   → allow, or make_forbidden_response()       # 403 on failure
 ```
@@ -355,10 +416,13 @@ _before_request(request)                     # Flask entry hook (auth, admin byp
 - **the validator** (`validate_can_*`) is the per-route capability gate — it calls a
   resolver and checks the resulting `Permission`'s `can_*` flag.
 - **the resolver** (`_get_permission_from_*`, unchanged custom logic) resolves the
-  parent + workspace and now also passes the child to the fold. Detailed in
+  parent + workspace (the values core wires onto the requirement's `parent_*` fields)
+  and passes them to the fold. Detailed in
   [Proposed changes to the permission fold](#proposed-changes-to-the-permission-fold).
-- **`get_role_permission_for_resource`** is the grant fold — max over the parent and
-  child clauses. Detailed in [The permission fold](#the-permission-fold).
+- **`get_role_permission_for_resource`** is the grant fold — the default backend's
+  realization of the decision: workspace-admin bypass, then child-tier resolution
+  (`NONE` deny / `max`), then parent fallback. Detailed in
+  [Proposed changes to the permission fold](#proposed-changes-to-the-permission-fold).
 
 Whether a route with no validator is allowed or denied (fail-open vs. fail-closed)
 is a platform-level concern being addressed upstream in
@@ -409,77 +473,66 @@ def get_role_permission_for_resource(self, user_id, resource_type, resource_id, 
 
 #### Proposed changes to the permission fold
 
-**What we implement:** the resolvers already resolve a child's parent today (e.g.
-`_get_permission_from_run_id` loads the run and gets its `experiment_id`), so the
-parent/child pairing is known *at the resolver*. We keep every resolver's custom
-logic intact and change only what it passes to the fold: the resolver still passes
-the parent `(resource_type, resource_key)` it computes today, and **additionally**
-passes the child `(child_type, child_id)`. The fold then folds in grants matching
-either. The only per-type metadata the fold needs is the **patterns** each type may
-be matched at — so `TYPE` is a flat `{name → patterns}` map (no hierarchy, no
-resolution callables; the hierarchy stays implicit in the resolver, where it already
-lives):
+**What we implement:** core resolves a child's parent today (e.g.
+`_get_permission_from_run_id` loads the run and gets its `experiment_id`) and wires
+it onto the requirement's `parent_*` fields. The default backend's fold takes the
+child `(resource_type, resource_id)` and the parent `(parent_resource_type,
+parent_resource_id)` and resolves them by **tier override**, not a cross-tier max:
+
+1. **workspace-admin bypass** — a `(workspace, *, MANAGE)` grant allows outright
+   (unchanged; evaluated ahead of everything, so admins are not restrictable);
+2. **child tier** — if the caller has *any* grant on the child type: `NONE` among
+   them denies, otherwise `max` of them. The parent is **not** consulted;
+3. **parent fallback** — only if the caller has *no* grant on the child type: resolve
+   the parent tier the same way (`NONE` denies, else `max`) — today's inheritance;
+4. **default** — nothing at either tier → `default_permission`.
+
+`NONE` is an absolute deny *within its tier*, evaluated ahead of the `max`; it does
+**not** override downward (a parent `NONE` denies a child only via fallback, never
+over a present child grant). Grants are matched at the **grain** the type declares —
+parents at wildcard-or-id (today's behavior), children at wildcard only.
+
+The concrete changes to the fold are: a resource-type registry declaring each type's
+allowed grain, a `matches` key that honors it, and two new optional `parent_*`
+arguments on `get_role_permission_for_resource` (the tier-override branching itself is
+the [flow above](#enforcing-permissions)):
 
 ```python
 class PatternKind(Enum):
-    WILDCARD = auto()   # "*" — matches any resource of the type
-    ID = auto()         # an exact resource id
-    # REGEX = auto()    # future: a pattern matched against the id (not in this RFC)
+    WILDCARD = auto()   # "*" — any resource of the type
+    ID       = auto()   # an exact resource id
+    # REGEX  = auto()   # future — not in this RFC
 
-WILDCARD_AND_ID = frozenset({PatternKind.WILDCARD, PatternKind.ID})  # parent grain (today's behavior)
-WILDCARD_ONLY = frozenset({PatternKind.WILDCARD})                    # child grain (per-id deferred)
+WILDCARD_AND_ID = frozenset({PatternKind.WILDCARD, PatternKind.ID})   # parent grain (today)
+WILDCARD_ONLY   = frozenset({PatternKind.WILDCARD})                   # child grain (per-id deferred)
 
-# name → allowed pattern kinds. Not serialized — grant rows still store the type string;
-# TYPE is a static in-process table (like get_permission for permission levels).
+# resource-type registry: name → allowed grain. Replaces the bare VALID_RESOURCE_TYPES
+# frozenset; membership is TYPE.keys(), so the valid-types set is derived, not maintained twice.
 TYPE = {
-    "workspace":        WILDCARD_AND_ID,
-    "experiment":       WILDCARD_AND_ID,
-    "registered_model": WILDCARD_AND_ID,
-    "prompt":           WILDCARD_AND_ID,
-    "run":              WILDCARD_ONLY,
-    "trace":            WILDCARD_ONLY,
-    "assessment":       WILDCARD_ONLY,
-    "logged_model":     WILDCARD_ONLY,
-    "model_version":    WILDCARD_ONLY,
-    # ... prompt_version, review_queue → WILDCARD_ONLY
+    "workspace": WILDCARD_AND_ID, "experiment": WILDCARD_AND_ID,
+    "registered_model": WILDCARD_AND_ID, "prompt": WILDCARD_AND_ID,
+    "run": WILDCARD_ONLY, "trace": WILDCARD_ONLY, "assessment": WILDCARD_ONLY,
+    "logged_model": WILDCARD_ONLY, "registered_model_version": WILDCARD_ONLY,
+    # ... prompt_version, scorer_version, mcp_server_version, review_queue → WILDCARD_ONLY
 }
-# VALID_RESOURCE_TYPES is replaced with a check to TYPE.keys() — the set is derived, not maintained separately.
 
-def matches(rp, patterns, resource_id):        # patterns: frozenset[PatternKind] → O(1) membership
-    if PatternKind.WILDCARD in patterns and rp.resource_pattern == "*":
-        return True
-    if PatternKind.ID in patterns and rp.resource_pattern == resource_id:
-        return True
-    # (PatternKind.REGEX would be handled here in future — re.fullmatch(rp.resource_pattern, resource_id))
-    return False
+def matches(rp, resource_type, resource_id):        # the match key, grain-aware
+    patterns = TYPE[resource_type]
+    return ((PatternKind.WILDCARD in patterns and rp.resource_pattern == "*")
+            or (PatternKind.ID in patterns and rp.resource_pattern == resource_id))
 
-# SqlAlchemyStore.get_role_permission_for_resource — the caller passes the resource it
-# resolved (parent, exactly as today) plus, for a sub-resource, the child (child_type,
-# child_id). The fold looks up only the PATTERNS for each type from TYPE and maxes grants
-# matching either. Signature gains two optional args; existing callers are unaffected.
+# signature gains parent_type/parent_id (the requirement's parent_* fields); existing
+# top-level callers pass neither and are unaffected. Body implements the tier override.
 def get_role_permission_for_resource(self, user_id, resource_type, resource_id, workspace,
-                                     child_type=None, child_id=None):   # (NEW) optional child clause
-    with self.ManagedSessionMaker() as session:
-        roles = ...                                      # (unchanged) load user's roles in `workspace`
-        if not roles:
-            return None
-        best = None
-        for role in roles:
-            for rp in role.permissions:
-                # (unchanged) workspace-admin fold
-                if rp.resource_type == RESOURCE_TYPE_WORKSPACE and rp.resource_pattern == "*":
-                    if resource_type == RESOURCE_TYPE_WORKSPACE or rp.permission == MANAGE.name:
-                        best = max_permission(best, rp.permission)
-                    continue
-                # self/parent clause — the resource the caller resolved (today's behavior)
-                if rp.resource_type == resource_type and matches(rp, TYPE[resource_type], resource_id):
-                    best = max_permission(best, rp.permission)
-                # (NEW) child clause — only when the caller supplied one
-                elif child_type and rp.resource_type == child_type \
-                        and matches(rp, TYPE[child_type], child_id):
-                    best = max_permission(best, rp.permission)
-        return get_permission(best) if best is not None else None
+                                     parent_type=None, parent_id=None):   # (NEW) parent tier
+    ...
 ```
+
+`NONE` resolves to a `Permission` that fails every `can_*` check, so a validator
+reading `.can_update` denies exactly as a missing grant would — the deny is carried
+as a first-class level rather than as an absent permission. Wildcard-only children
+match only `(child, *, …)` grants; a concrete-id child grant is rejected at grant
+time (see [Grant validation](#grant-validation)).
 
 Re-pointing a route means naming a **child** validator in `BEFORE_REQUEST_HANDLERS`
 where it named the parent's, and giving that validator's resolver the child clause.
@@ -488,21 +541,25 @@ For `CreateRun`:
 ```python
 # BEFORE_REQUEST_HANDLERS
 - CreateRun: validate_can_update_experiment    # gated on the parent experiment
-+ CreateRun: validate_can_update_run           # gated on the run (child) and parent experiment
++ CreateRun: validate_can_update_run           # gated on the run (child), parent wired through
 
 # the validator (same one-line shape as every validate_can_*)
 + def validate_can_update_run():
 +     return _get_permission_from_run_id().can_update
 
-# the resolver — today's parent/workspace logic UNCHANGED; only the child clause is added
+# the resolver — today's parent/workspace resolution UNCHANGED; the run becomes the
+# resolved resource and the experiment is wired through as the parent tier
   def _get_permission_from_run_id():
       run = get_run(run_id); experiment_id = run.info.experiment_id
       return _get_role_permission_or_default(_role_permission_for(
-          resource_type="experiment", resource_key=experiment_id,   # parent — as today
+          resource_type="run", resource_key=run_id,                 # child — the resolved resource
           workspace_lookup_id=experiment_id, workspace_fetcher=get_experiment,
-+         child_type="run", child_id=run_id,                        # (NEW) the child clause
++         parent_type="experiment", parent_id=experiment_id,        # (NEW) parent tier (fallback)
       ))
 ```
+
+`parent_type`/`parent_id` are what core stamps onto the requirement's `parent_*`
+fields; the fold uses them only when the caller has no grant on `run`.
 
 Below table summarrizes this for all APIs supported today:
 
@@ -512,41 +569,29 @@ Below table summarrizes this for all APIs supported today:
 | `StartTrace`, `SetTraceTag` | experiment `can_update` | `trace` `can_update` |
 | `CreateAssessment`, `UpdateAssessment`, `DeleteAssessment` | trace→experiment `can_update` | `assessment` `can_update` |
 | `CreateLoggedModel` | experiment `can_update` | `logged_model` `can_update` |
-| `CreateModelVersion` | registered_model update | `model_version` `can_update` |
+| `CreateModelVersion` | registered_model update | `registered_model_version` `can_update` |
 | `CreateModelVersion` (prompt) | prompt update | `prompt_version` `can_update` |
 | `CreateReviewQueue`, `AddItemsToReviewQueue`, `RemoveItemsFromReviewQueue` | experiment `can_update` (mixed) | `review_queue` `can_update` |
-
-#### Search filtering
-
-Result-set filtering must scope to the caller's authorized set **without**
-over-fetching. This RFC supports wildcard-grain child grants, so the read predicate
-is a single check per resource type:
-
-- `(child, *, READ+)` → the caller can read all children of that type in the
-  workspace (one boolean, as `filter_search_experiments` uses `wildcard_can_read`
-  today).
-- No child grant → inherited from the parent (today's behavior).
-
-Per-ID child grants are **not** supported precisely because they cannot be filtered
-efficiently: post-response filtering requires scanning/​over-fetching to fill a
-page, which is pathological for high-cardinality children like traces. The scalable
-path is request-level (pre-request) predicate push-down (see mlflow/mlflow#24964),
-which injects the caller's authorized set into the store query so the search never
-over-fetches. **Id-level grain will be added for these child types once that
-search-filter push-down is in place**; until then the grain is wildcard-only. This
-RFC does not depend on the push-down because wildcard grain already routes through
-the cheap `wildcard_can_read` path above.
+| `CreateScorer` (new version) | scorer `can_update` | `scorer_version` `can_update` |
+| MCP server version create (`_is_mcp_server_version_create_path`) | mcp_server `can_update` | `mcp_server_version` `can_update` |
 
 #### Performance
 
-- **No child grant (the common/back-compat case):** the fold does one extra
-  in-memory comparison — the new parent clause is evaluated against the role
-  permission rows that are **already loaded** for the workspace (the fold iterates
-  them regardless). It is an added `max_permission` operand in the existing loop,
-  not a new DB query.
-- **Child grant present:** same cost — the child grant is among the same
-  already-loaded rows. Resolution stays one pass over the in-memory rows, not
-  additional round-trips.
+- **No child grant (the common/back-compat case):** the child tier resolves to empty
+  and the fold falls back to the parent tier — the same rows it would have folded
+  before. Both tiers are scanned over the role-permission rows **already loaded** for
+  the workspace (the fold iterates them regardless); no new DB query.
+- **Child grant present:** the child tier resolves and the parent is not consulted —
+  strictly less work. The child grant is among the same already-loaded rows.
+- **`NONE`:** a membership check for the deny level within the tier's grants, in the
+  same in-memory pass. No additional round-trips in any case.
+- **Under the pluggable backend (RFC 0008):** the parent rides on the *same*
+  `AuthorizationRequirement` as an optional field (see
+  [The AuthorizationRequirement](#the-authorizationrequirement-parent-wired-through)),
+  so a child check is still **one** `authorize()` call, not two. Child-tier-first
+  with parent fallback means the parent is resolved only when the child tier is
+  empty, so the common case does no extra work; there is no separate parent
+  `authorize()` round-trip to double the cost.
 
 #### UI impact
 
@@ -584,45 +629,54 @@ UI-specific enforcement is added. The consequences are UX, not authorization:
 - **More grants per role when escalation is used.** A role that needs child-level
   access must add a child grant per type. Mitigated: unused child types simply
   inherit; only roles that need escalation add grants.
+- **`NONE` makes the model non-monotonic.** Adding a `NONE` grant *reduces* a user's
+  access, unlike every positive grant. This is the price of restriction and is a
+  one-way door — once roles rely on `NONE` deny semantics, they cannot be removed
+  without changing those roles' effective access. Contained: `NONE` is only
+  evaluated within its own tier, never overrides a present child grant downward, and
+  the workspace-admin bypass is unaffected.
 
 # Alternatives
 
 ### A. Two-mode flag (`simplified` / `fine_grained`)
 
 A global config flag selects between "children always inherit" and "children are
-independently permissioned." **Rejected:** it is all-or-nothing (raised in review
-as the primary objection), maintains two resolution regimes behind a branch, and
-requires a mode-transition story (pre-creating grants before flipping). The `max`
-model needs no flag — inheritance is simply `max` with no child grant present.
+independently permissioned." **Rejected:** it is all-or-nothing, maintains two
+resolution regimes behind a branch, and requires a mode-transition story
+(pre-creating grants before flipping). The `max` model needs no flag — inheritance is
+simply `max` with no child grant present.
 
-### B. Downward-override / most-specific-wins
+### B. `inherit` flag instead of `NONE` (Model A)
 
-A child grant *replaces* the inherited parent permission, so it can raise **or**
-lower a child (e.g. "EDIT the experiment but restrict traces to READ"), including a
-configurable `NONE`/deny action raised in review — e.g. `(experiment, *, READ)` +
-`(assessment, *, EDIT)` + `(run, *, NONE)` + `(logged_model, *, NONE)` to let an
-evaluator write assessments while *hiding* runs and models.
-**Rejected — this does not fit MLflow's authorization model.** MLflow RBAC is
-allow-only and monotonic: every grant combination folds with `max_permission`
-(workspace-wide and resource-specific grants alike), and there is no explicit
-deny anywhere in the model. A `NONE`/deny action is downward-override by another
-name — `max("READ", "NONE")` cannot lower the inherited READ, so honoring it would
-require abandoning the `max` fold for a most-specific-wins rule with explicit deny.
-That would introduce a non-monotonic rule that behaves differently from the rest of
-the system — adding a grant could *reduce* a user's access, which is surprising and
-inconsistent with how every other grant works. We are electing not to support
-lowering a child below its parent. Note the *escalation* half of the evaluator case
-is already served additively (`(experiment, READ)` + `(assessment, EDIT)` → view all,
-write assessments); the only thing `NONE` adds is *hiding* sibling children, a deny
-capability with no current demand on record — every requirement is an escalation. If
-a genuine restriction use case ever arises, it should be an explicit, opt-in
-resolution mode with its own precedence rules, not a change to this model.
+Keep escalation-only `max` and express *restriction* by a per-child-type
+`inherit=true|false` toggle rather than a `NONE` grant: `inherit=false` drops the
+parent fallback, so a child with no explicit grant is denied. **Rejected in favor of
+`NONE`:**
 
-### C. Per-grant `inherit` flag
+- **Migration.** Restricting one sub-resource with `NONE` is a single additive grant
+  (`(trace, *, NONE)`) that leaves the existing `(experiment, *, EDIT)` and all other
+  inheritance untouched — a surgical carve-out. `inherit=false` instead *detaches*
+  the child from inheritance and forces re-declaring whatever access was still
+  wanted (detach-and-redeclare, not a patch).
+- **Mental model.** "Grant broadly, deny the exceptions" is more familiar than
+  reasoning about per-child inheritance topology.
+- **No refactor saving.** The tiered/parent-aware fold is required by inheritance
+  regardless (it is a consequence of wiring the parent through), so `inherit` buys no
+  simpler resolver — and `inherit=true` vs `false` itself branches the fold into two
+  decision trees, eroding the "single monotonic pass" it was meant to preserve.
+- **Granularity.** `inherit=false` is all-or-nothing per child type; `NONE` restricts
+  per child type/instance and composes with escalation grants on other children.
 
-Add `inherit=True|False` to each grant. **Rejected:** ambiguous when two grants on
-the same resource type disagree, and it relocates rather than removes the
-two-behavior complexity — every validator still branches on inherit-or-not.
+### C. Downward-override / most-specific-wins (child fully replaces parent)
+
+A child grant *replaces* the parent, so any child grant — positive or `NONE` —
+overrides the inherited level in both directions. **Rejected:** we keep child grants
+authoritative only *when present* and `NONE` as an explicit deny, but do **not** let
+a lower positive child grant silently reduce inherited access beyond an explicit
+`NONE`; and, critically, a parent `NONE` does **not** override a present child grant
+downward (it denies a child only via fallback). Full most-specific-wins in both
+directions makes "adding a positive grant reduces access" possible, which is more
+surprising than a single explicit deny level.
 
 ### D. Capability-split or action-based permissions
 
@@ -644,9 +698,10 @@ Operators who want child-level escalation:
 3. Optionally downgrade the parent grant now that the child is granted directly
    (e.g. experiment `EDIT` → `READ` once `(run, *, EDIT)` covers logging).
 
-There is no mode to flip and nothing to revert: removing a child grant returns
-that child to pure inheritance.
+Operators who want child-level restriction:
+1. Add a `(child, *, NONE)` grant to deny one child type while the parent grant and
+   all other inheritance stay intact (e.g. `(trace, *, NONE)` to hide traces from a
+   role that keeps experiment `EDIT`).
 
-# Open questions
-
-_None at this time; will be added as they come up during review._
+There is no mode to flip: removing a child grant — positive or `NONE` — returns that
+child to pure inheritance.
