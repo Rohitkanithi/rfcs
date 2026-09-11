@@ -588,7 +588,7 @@ class SkillVersion:
     name: str
     version: int
     organization: str = ""
-    source: GitSource | OCISource | ZipSource | str | None = None  # plain str for mlflow content
+    source: GitSource | OCISource | ZipSource | MlflowSource | None = None  # MlflowSource is server-populated, never client-constructed
     source_type: SkillSourceType | None = None
     digest: str | None = None
     status: SkillStatus = SkillStatus.ACTIVE
@@ -607,7 +607,7 @@ class SkillVersion:
 | `name` | `str` | Skill name (part of composite key with workspace and organization) |
 | `version` | `int` | Server-assigned monotonic integer. Each new version receives the next integer |
 | `organization` | `str` | Organization scope, from parent Skill |
-| `source` | `GitSource \| OCISource \| ZipSource \| str \| None` | Typed source descriptor for external content (git, OCI, zip); a plain `str` for `mlflow` content. For `source_type="mlflow"`, `source` is a server-set artifact path: for a standalone MLflow-stored skill it is the unique path where the server stored the uploaded content, and for a skill created by importing an MLflow-stored packaged plugin it is the package's artifact base path (a self-contained internal `mlflow-artifacts:` pointer captured at import time, with `subpath` locating the skill within that tree). A skill created by importing a packaged plugin more generally carries a source derived from the package: the package's `source_type` and `source` with a `subpath` locating the skill within the package. Because an imported member's pointer is stored on the skill version itself, its content resolves without reference to any membership row. The REST API represents this as flat `source_type`, `source`, `ref`, `subpath` fields; the SDK wraps and unwraps the typed classes (an `mlflow` `source` is a plain artifact-path string rather than a typed class) |
+| `source` | `GitSource \| OCISource \| ZipSource \| MlflowSource \| None` | Typed source descriptor. External content (git, OCI, zip) uses the client-constructible classes; `mlflow` content uses `MlflowSource`, which the server populates on responses and a client never constructs (see Typed source classes). For `source_type="mlflow"`, `MlflowSource.path` is a server-set artifact path: for a standalone MLflow-stored skill it is the unique path where the server stored the uploaded content (and `subpath` is null), and for a skill created by importing an MLflow-stored packaged plugin it is the package's artifact base path (a self-contained internal `mlflow-artifacts:` pointer captured at import time), with `subpath` locating the skill within that tree. A skill created by importing a packaged plugin more generally carries a source derived from the package: the package's `source_type` and `source` with a `subpath` locating the skill within the package. Because an imported member's pointer is stored on the skill version itself, its content resolves without reference to any membership row. The REST API represents this as flat `source_type`, `source`, `ref`, `subpath` fields; the SDK wraps and unwraps the typed classes uniformly, so `source.subpath` is available for every source type |
 | `source_type` | `SkillSourceType \| None` | Server-set discriminator (`git`, `oci`, `zip`, `mlflow`), populated on responses. On create, a client that knows the type of an external pointer (CLI subcommand, SDK typed class) submits it and the server validates it against the source value; without an explicit type the server infers it (see the field-inference rules below). `mlflow` is flow-derived and never client-supplied. Together with `source` it determines how content is stored and how `pull` routes |
 | `digest` | `str \| None` | Content hash of the resolved skill content (the same notion as a dataset `digest`). Computed by the client during local inspection and submitted at registration and import; client-asserted and not server-verified. It identifies a version by content within a skill name. Stored, returned on get, and indexed so callers can group versions by content (clean diffs between agent plugin versions, and traces before and after a change linking to the same content); it does not drive import, which always creates a new member version (see Content digest) |
 | `status` | `SkillStatus` | Per-version lifecycle: `draft`, `active`, `deprecated`, `deleted` |
@@ -633,13 +633,12 @@ only the fields relevant to that type:
 | `GitSource` | `url`, `ref`, `subpath` | Git repository. `url` is the clone URL, passed to git as given: any URL the caller's git can clone is valid, and a `.git` suffix is not required (the suffix matters only to the inference fallback, never to fetching). Provider web URLs (e.g., a GitHub `/tree/...` page) are not clone URLs; supply the clone URL and put the branch and directory in `ref` and `subpath`. `ref` is the branch, tag, or commit (optional; defaults to the repository's default branch). `subpath` is the path within the repo (optional). |
 | `OCISource` | `image`, `subpath` | OCI image. `image` is the image reference, optionally supplied with the `oci://` scheme (e.g., `oci://ghcr.io/acme/plugin:v1`). The scheme is a hint only, used to infer `source_type` when no explicit type accompanies the request and validated against it when one does: the persisted `source` is the bare reference (`ghcr.io/acme/plugin:v1`). `subpath` is the path within the image (optional). |
 | `ZipSource` | `url`, `subpath` | ZIP archive. `url` is the archive URL. `subpath` is the path within the archive (optional). |
+| `MlflowSource` | `path`, `subpath` | Content in MLflow artifact storage. Read-side only: the server populates it on responses, and a client never constructs one for registration, because the artifact `path` is server-chosen (the upload flow assigns it; see Client-side upload flow) and a client-supplied `mlflow` source is rejected (see Field inference). For a standalone upload, `path` is the unique path where the server stored the content and `subpath` is null, since the whole stored tree is the skill. For a skill imported from an MLflow-stored package, `path` is the artifact base of the package tree and `subpath` locates the skill within it. |
 
-MLflow artifact storage does not use a source class; its `source` is a plain
-artifact-path string. For a standalone upload it is the unique path where the
-server stored the content (see Client-side upload flow); the whole stored tree
-is the skill, so `subpath` is null. For a skill imported from a package it is
-the artifact base of the package tree, and `subpath` locates the skill within
-it.
+`MlflowSource` exists so that `source.subpath` means the same thing for every
+source type. Without it, a member imported from an MLflow-stored package would
+have no place to carry the subpath that `pull` needs to fetch just that member,
+and would be indistinguishable from the package root.
 
 The REST API represents these as flat fields (`source_type`,
 `source`, `ref`, `subpath`); the SDK converts between typed classes
@@ -651,10 +650,11 @@ discarded in the flat representation. The server validates a submitted
 submitted, sets it from the creation flow for content it stores itself
 (the upload flow; see the field-inference rules below),
 and returns it in responses. The SDK surfaces `source_type` as a field on
-the version and uses it to reconstruct the typed class for external
-sources; for `mlflow` content the `source` is a plain artifact-path string,
-the server-stored upload path for a standalone skill or the package artifact
-base for an imported member.
+the version and uses it to reconstruct the typed class from the flat
+fields for every source type: an external class for `git`/`oci`/`zip`,
+and `MlflowSource` (with `path` set to the server-stored upload path for a
+standalone skill or the package artifact base for an imported member, plus
+the persisted `subpath`) for `mlflow`.
 
 **Content digest.** Each version carries a `digest`, a SHA-256 hash
 (lowercase hex, 64 characters) of the resolved skill content: the `SKILL.md`
@@ -881,7 +881,7 @@ class AgentPluginVersion:
     version: str
     organization: str = ""
     plugin_json: dict[str, Any] = field(default_factory=dict)
-    source: GitSource | OCISource | ZipSource | str | None = None  # plain str for mlflow content
+    source: GitSource | OCISource | ZipSource | MlflowSource | None = None  # MlflowSource is server-populated, never client-constructed
     source_type: SkillSourceType | None = None
 
     status: SkillStatus = SkillStatus.ACTIVE
@@ -1503,7 +1503,9 @@ def register_skill(
     source field with type inferred by the server, and a plain string
     whose type cannot be inferred is rejected with an error directing
     the caller to a typed source class. The creation flow sets mlflow
-    when the client uploads a local path.
+    when the client uploads a local path; MlflowSource is a response-side
+    value only, and passing one here is rejected, since the artifact
+    path is server-chosen.
     If source is a local path (no :// scheme), the client submits the
     packaged content with the registration request and the server stores
     it and creates the version in one atomic operation (no separate
