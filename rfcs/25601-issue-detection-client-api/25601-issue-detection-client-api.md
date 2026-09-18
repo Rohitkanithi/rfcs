@@ -3,9 +3,35 @@
 | start_date | 2026-09-18 |
 | :--- | :--- |
 | **mlflow_issue** | https://github.com/mlflow/mlflow/issues/25601 |
-| **rfc_pr** | |
+| **rfc_pr** | https://github.com/mlflow/rfcs/pull/52 |
 | **Author(s)** | [Rohitkanithi](https://github.com/Rohitkanithi), [Adam Gurary](https://github.com/adamgurary), [Joshua Wong](https://github.com/joshuawong-db), [Haoji Tang](https://github.com/tanghaoji) |
 | **Date Last Modified** | 2026-09-18 |
+
+---
+
+**Table of contents**
+
+- [Summary](#summary)
+- [Basic Example](#basic-example)
+  - [1. Submitting an Asynchronous Issue Detection Job](#1-submitting-an-asynchronous-issue-detection-job)
+  - [2. Searching and Retrieving Detected Issues](#2-searching-and-retrieving-detected-issues)
+- [Motivation](#motivation)
+  - [The Problem](#the-problem)
+  - [Use Cases](#use-cases)
+  - [Out of Scope](#out-of-scope)
+- [Detailed Design](#detailed-design)
+  - [Architecture & System Overview](#architecture--system-overview)
+  - [End-to-End Component Flow & Lifecycle](#end-to-end-component-flow--lifecycle)
+  - [1. Protobuf Protocol Specification](#1-protobuf-protocol-specification)
+  - [2. Server-Side Execution & Security Model](#2-server-side-execution--security-model)
+  - [3. Store Layer Contracts](#3-store-layer-contracts)
+  - [4. Python Client API (MlflowClient)](#4-python-client-api-mlflowclient)
+  - [5. Entity Model & Schema](#5-entity-model--schema)
+  - [6. Query & Filter Grammar](#6-query--filter-grammar)
+- [Drawbacks](#drawbacks)
+- [Alternatives Considered](#alternatives-considered)
+- [Adoption Strategy](#adoption-strategy)
+- [Open Questions](#open-questions)
 
 ---
 
@@ -86,34 +112,100 @@ However, currently:
 
 ## Detailed Design
 
-### Architecture & Component Flow
+### Architecture & System Overview
 
 ```
-+-------------------------------------------------------------+
-|                      Python Client                          |
-|  client.submit_issue_detection(experiment_id, trace_ids...) |
-+-------------------------------------------------------------+
-                              |
-                              | Protobuf RPC (POST /api/2.0/mlflow/issues/invoke)
-                              v
-+-------------------------------------------------------------+
-|                 MLflow Tracking Server                      |
-|                                                             |
-|  1. Authenticate caller & validate experiment permissions:  |
-|     validate_can_update_experiment(experiment_id)           |
-|                                                             |
-|  2. Resolve LLM provider credentials server-side            |
-|     (AI Gateway, Secret Store, or Server Environment)       |
-|                                                             |
-|  3. Launch asynchronous job & create tracking run:          |
-|     invoke_issue_detection_job(...) -> job_id, run_id       |
-+-------------------------------------------------------------+
-                              |
-                              v
-+-------------------------------------------------------------+
-|                     Tracking Store                          |
-|  Persists run metadata, tags, and detected Issue entities   |
-+-------------------------------------------------------------+
++===================================================================================+
+|                                APPLICATION LAYER                                  |
+|                                                                                   |
+|  +---------------------------+  +--------------------------+  +----------------+  |
+|  | CI / CD Evaluation Suites |  | Scheduled Batch Scanners |  | AI Agents / UI |  |
+|  +---------------------------+  +--------------------------+  +----------------+  |
++===================================================================================+
+                                         |
+                                         | Python SDK
+                                         v
++===================================================================================+
+|                                MLFLOW CLIENT LAYER                                |
+|                                                                                   |
+|  MlflowClient:                                                                    |
+|    - submit_issue_detection(experiment_id, trace_ids, categories, provider...)   |
+|    - search_issues(experiment_id, source_run_id, filter_string...)                |
+|                                                                                   |
+|  RestStore / DatabricksRestStore:                                                 |
+|    - Serializes typed Protobuf messages (SubmitIssueDetection)                    |
+|    - Dispatches HTTP requests to /api/2.0/mlflow/issues/invoke                    |
++===================================================================================+
+                                         |
+                                         | HTTPS (JSON over Protobuf RPC)
+                                         v
++===================================================================================+
+|                              TRACKING SERVER & API ROUTER                         |
+|                                                                                   |
+|  Endpoint: POST /api/2.0/mlflow/issues/invoke                                     |
+|  Handler: _invoke_issue_detection_handler                                         |
+|                                                                                   |
+|  +-----------------------------+     +-----------------------------------------+  |
+|  | Security & Permissions      |     | Credential Resolution                   |  |
+|  | validate_can_update_exp(...) |     | - MLflow AI Gateway Endpoints           |  |
+|  | Verify caller write access  |     | - Server Environment (OPENAI_API_KEY)   |  |
+|  +-----------------------------+     | - Server-Side Secret Store (secret_id)  |  |
+|                                      +-----------------------------------------+  |
++===================================================================================+
+                                         |
+                                         v
++===================================================================================+
+|                             BACKGROUND JOB EXECUTOR                               |
+|                                                                                   |
+|  invoke_issue_detection_job(...)                                                  |
+|    1. Creates MLflow Run in Experiment (tracking run_id)                          |
+|    2. Fetches target Trace spans from Tracking Store                              |
+|    3. Spawns asynchronous worker execution                                       |
+|    4. Calls LLM via Gateway / resolved credentials to cluster & score traces      |
+|    5. Writes discovered Issue entities to database                                |
++===================================================================================+
+                                         |
+                     +-------------------+-------------------+
+                     |                                       |
+                     v                                       v
++====================================+      +======================================+
+|          LLM PROVIDER / GATEWAY    |      |          TRACKING DATABASE           |
+|                                    |      |                                      |
+|  - OpenAI / Anthropic / Bedrock    |      |  - runs (metadata & issue run tags)  |
+|  - Managed AI Gateway Route        |      |  - issues (issue_id, severity, etc.) |
+|  - Evaluates prompts & clusters    |      |  - trace_tags / issue associations   |
++====================================+      +======================================+
+```
+
+---
+
+### End-to-End Component Flow & Lifecycle
+
+```
+Client                      MLflow Server                 Job Executor                Store / LLM
+  |                               |                            |                           |
+  |-- submit_issue_detection() -->|                            |                           |
+  |   (Protobuf RPC)              |                            |                           |
+  |                               |-- validate_permissions() ->|                           |
+  |                               |-- resolve_credentials() -->|                           |
+  |                               |                            |                           |
+  |                               |-- invoke_job() ----------->|                           |
+  |                               |                            |-- create_run(experiment)->|
+  |                               |<-- return (job_id, run_id)-|                           |
+  |<-- IssueDetectionJob ---------|                            |                           |
+  |    (job_id, run_id)           |                            |                           |
+  |                               |                            |-- fetch_traces() -------->|
+  |                               |                            |<-- return trace spans ----|
+  |                               |                            |                           |
+  |                               |                            |-- evaluate_issues(LLM) -->|
+  |                               |                            |<-- identified clusters ---|
+  |                               |                            |                           |
+  |                               |                            |-- persist_issues() ------>|
+  |                               |                            |-- update_run(FINISHED) -->|
+  |                               |                            |                           |
+  |-- search_issues(run_id) ----->|                            |                           |
+  |   (filter_string="...")       |-- query_issues() ------------------------------------->|
+  |<-- PagedList[Issue] ----------|<-- return matching issues -----------------------------|
 ```
 
 ---
@@ -299,13 +391,36 @@ def search_issues(
 
 ---
 
-### 5. Entity Model
+### 5. Entity Model & Schema
 
 Exposed in `mlflow.entities`:
-- **`Issue`**: Contains `issue_id`, `experiment_id`, `name`, `description`, `status` (`IssueStatus`), `severity` (`IssueSeverity`), `root_causes`, `source_run_id`, `categories`, and `trace_count`.
+- **`Issue`**:
+  - `issue_id: str`
+  - `experiment_id: str`
+  - `name: str`
+  - `description: str`
+  - `status: IssueStatus`
+  - `severity: IssueSeverity`
+  - `root_causes: list[str]`
+  - `categories: list[str]`
+  - `source_run_id: str`
+  - `trace_count: int | None`
 - **`IssueDetectionJob`**: Lightweight handle containing `job_id: str` and `run_id: str`.
 - **`IssueStatus`**: Enum (`pending`, `rejected`, `resolved`).
-- **`IssueSeverity`**: Comparable Enum (`not_an_issue`, `low`, `medium`, `high`) supporting `<` and `>` comparisons.
+- **`IssueSeverity`**: Comparable Enum (`not_an_issue`, `low`, `medium`, `high`) supporting order comparisons (`<`, `<=`, `>`, `>=`).
+
+---
+
+### 6. Query & Filter Grammar
+
+The `filter_string` parameter in `search_issues` supports standard MLflow SQL-like search grammar:
+
+| Field | Supported Operators | Example |
+| :--- | :--- | :--- |
+| `severity` | `=`, `!=`, `>`, `>=`, `<`, `<=` | `severity >= 'medium'` |
+| `status` | `=`, `!=` | `status = 'pending'` |
+| `source_run_id` | `=`, `!=` | `source_run_id = 'run-1234'` |
+| `name` | `=`, `!=`, `LIKE`, `ILIKE` | `name ILIKE '%hallucination%'` |
 
 ---
 
